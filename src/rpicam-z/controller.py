@@ -2,7 +2,7 @@ import io, time, threading, os
 from datetime import datetime
 from picamera2 import Picamera2
 from libcamera import Transform
-from camera.camera_utils import validate_control_value # Importamos el validador
+from camera_utils import validate_control_value # Importamos el validador
 
 class CameraController:
     def __init__(self, width=1640, height=1232, rotation=0, save_path="captures"):
