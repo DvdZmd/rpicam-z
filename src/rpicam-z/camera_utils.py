@@ -1,7 +1,4 @@
-from enum import auto
-from typing import Dict, Any, List, Tuple, Optional
-from logs.logging_config import logger
-
+from typing import Dict, Any, Tuple
 
 class CameraPresets:
     """Presets predefinidos para diferentes escenarios de cámara"""
