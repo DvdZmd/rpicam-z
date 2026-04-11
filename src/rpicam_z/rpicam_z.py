@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 from rpicam_z.camera_utils import CameraPresets, validate_control_value
@@ -17,6 +18,16 @@ except ModuleNotFoundError as exc:
     Picamera2 = None
     Transform = None
     CAMERA_IMPORT_ERROR = exc
+
+
+@dataclass(frozen=True)
+class FramePacket:
+    """JPEG frame payload enriched with capture identifiers and timestamps."""
+
+    frame_id: int
+    jpeg_bytes: bytes
+    captured_wall_time_ns: int
+    captured_monotonic_ns: int
 
 
 class RpiCamZ:
@@ -60,6 +71,7 @@ class RpiCamZ:
         self.lock = threading.Lock()
         self.timelapse_thread = None
         self.timelapse_active = False
+        self._frame_counter = 0
 
         self._detect_sensor_limits()
         self._initialize_camera()
@@ -178,9 +190,7 @@ class RpiCamZ:
     def take_snapshot(self):
         """Capture a JPEG frame from the current stream."""
         with self.lock:
-            buf = io.BytesIO()
-            self.picam2.capture_file(buf, format="jpeg")
-            return buf.getvalue()
+            return self._capture_jpeg_bytes()
 
     def update_control(self, name, value):
         """Validate and apply a camera control change."""
@@ -232,9 +242,7 @@ class RpiCamZ:
                 self.picam2.start()
                 self.is_running = True
 
-                buf = io.BytesIO()
-                self.picam2.capture_file(buf, format="jpeg")
-                return buf.getvalue()
+                return self._capture_jpeg_bytes()
             finally:
                 if self.is_running:
                     self.picam2.stop()
@@ -242,12 +250,33 @@ class RpiCamZ:
                 self.current_width, self.current_height = old_width, old_height
                 self._initialize_camera()
 
-    def get_jpeg_frame(self):
-        """Capture a JPEG frame directly from the running pipeline."""
+    def _capture_jpeg_bytes(self) -> bytes:
+        """Capture a JPEG into memory.
+
+        This helper expects the caller to hold ``self.lock`` when thread safety
+        matters.
+        """
+        buf = io.BytesIO()
+        self.picam2.capture_file(buf, format="jpeg")
+        return buf.getvalue()
+
+    def get_frame_packet(self) -> FramePacket:
+        """Capture a JPEG frame together with per-frame timing metadata."""
         with self.lock:
-            buf = io.BytesIO()
-            self.picam2.capture_file(buf, format="jpeg")
-            return buf.getvalue()
+            jpeg_bytes = self._capture_jpeg_bytes()
+            captured_wall_time_ns = time.time_ns()
+            captured_monotonic_ns = time.monotonic_ns()
+            self._frame_counter += 1
+            return FramePacket(
+                frame_id=self._frame_counter,
+                jpeg_bytes=jpeg_bytes,
+                captured_wall_time_ns=captured_wall_time_ns,
+                captured_monotonic_ns=captured_monotonic_ns,
+            )
+
+    def get_jpeg_frame(self) -> bytes:
+        """Capture a JPEG frame directly from the running pipeline."""
+        return self.get_frame_packet().jpeg_bytes
 
     def start_timelapse(self, interval_seconds, width=None, height=None):
         """Start a background timelapse capture thread."""
@@ -312,6 +341,7 @@ rpicam_z = RpiCamZ
 __all__ = [
     "CAMERA_IMPORT_ERROR",
     "CameraController",
+    "FramePacket",
     "RpiCamZ",
     "UnavailableCamera",
     "rpicam_z",
