@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -39,7 +40,15 @@ class RpiCamZ:
     camera hardware.
     """
 
-    def __init__(self, width=1640, height=1232, rotation=0, save_path="captures"):
+    def __init__(
+        self,
+        width=1640,
+        height=1232,
+        rotation=0,
+        save_path="captures",
+        frame_interval_seconds=0.1,
+        frame_buffer_size=60,
+    ):
         if CAMERA_IMPORT_ERROR is not None:
             raise RuntimeError(
                 "Camera dependencies are unavailable. Original import error: "
@@ -72,9 +81,19 @@ class RpiCamZ:
         self.timelapse_thread = None
         self.timelapse_active = False
         self._frame_counter = 0
+        self.frame_interval_seconds = max(0.01, float(frame_interval_seconds))
+        self._frame_buffer_size = max(1, int(frame_buffer_size))
+        self._frame_thread = None
+        self._frame_thread_running = False
+        self._frame_stop_event = threading.Event()
+        self._frame_condition = threading.Condition()
+        self._frame_generation = 0
+        self._latest_frame = None
+        self._frame_buffer = deque(maxlen=self._frame_buffer_size)
+        self._frame_wait_timeout_seconds = max(0.1, self.frame_interval_seconds * 5)
 
         self._detect_sensor_limits()
-        self._initialize_camera()
+        self._reconfigure_camera()
 
     def __enter__(self):
         return self
@@ -94,7 +113,7 @@ class RpiCamZ:
         except Exception as exc:
             logger.debug("Unable to detect sensor limits: %s", exc)
 
-    def _initialize_camera(self):
+    def _configure_running_camera_locked(self):
         """Configure and start the camera using the current settings."""
         if self.is_running:
             self.picam2.stop()
@@ -122,9 +141,59 @@ class RpiCamZ:
         self.picam2.start()
         self.is_running = True
 
+    def _reset_frame_cache(self):
+        """Clear cached frames so callers never observe stale stream data."""
+        with self._frame_condition:
+            self._latest_frame = None
+            self._frame_buffer.clear()
+
+    def _start_frame_producer(self):
+        """Start the background JPEG producer for the active camera pipeline."""
+        with self._frame_condition:
+            thread = self._frame_thread
+            if thread and thread.is_alive():
+                return
+            self._frame_stop_event.clear()
+            self._frame_generation += 1
+            frame_generation = self._frame_generation
+            self._frame_thread_running = True
+            self._frame_thread = threading.Thread(
+                target=self._frame_worker,
+                args=(frame_generation,),
+                name="rpicam-z-frame-producer",
+                daemon=True,
+            )
+            self._frame_thread.start()
+
+    def _stop_frame_producer(self):
+        """Stop the background JPEG producer and wait briefly for it to exit."""
+        with self._frame_condition:
+            thread = self._frame_thread
+            self._frame_thread_running = False
+            self._frame_generation += 1
+            self._frame_stop_event.set()
+            self._frame_condition.notify_all()
+
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, self.frame_interval_seconds * 10))
+
+        with self._frame_condition:
+            if self._frame_thread is thread:
+                self._frame_thread = None
+
+    def _reconfigure_camera(self):
+        """Restart the camera pipeline and its frame producer cleanly."""
+        self._stop_frame_producer()
+        self._reset_frame_cache()
+        with self.lock:
+            self._configure_running_camera_locked()
+        self._start_frame_producer()
+
     def close(self):
         """Stop background work and release the camera cleanly."""
         self.stop_timelapse()
+        self._stop_frame_producer()
+        self._reset_frame_cache()
         with self.lock:
             if self.is_running:
                 self.picam2.stop()
@@ -135,14 +204,13 @@ class RpiCamZ:
 
     def reset_to_defaults(self):
         """Restore the initial stream configuration and camera controls."""
-        with self.lock:
-            self.current_width = self.default_config["width"]
-            self.current_height = self.default_config["height"]
-            self.current_rotation = self.default_config["rotation"]
-            self.controls = dict(self.default_config["controls"])
-            if self.af_supported:
-                self.controls["AfMode"] = 2
-            self._initialize_camera()
+        self.current_width = self.default_config["width"]
+        self.current_height = self.default_config["height"]
+        self.current_rotation = self.default_config["rotation"]
+        self.controls = dict(self.default_config["controls"])
+        if self.af_supported:
+            self.controls["AfMode"] = 2
+        self._reconfigure_camera()
 
     def apply_preset(self, preset_name):
         """Apply a preset from ``CameraPresets`` to the active camera."""
@@ -182,10 +250,9 @@ class RpiCamZ:
 
     def set_resolution(self, width, height):
         """Update the stream resolution and restart the camera pipeline."""
-        with self.lock:
-            self.current_width = int(width)
-            self.current_height = int(height)
-            self._initialize_camera()
+        self.current_width = int(width)
+        self.current_height = int(height)
+        self._reconfigure_camera()
 
     def take_snapshot(self):
         """Capture a JPEG frame from the current stream."""
@@ -215,13 +282,14 @@ class RpiCamZ:
         if angle not in [0, 90, 180, 270]:
             return False
 
-        with self.lock:
-            self.current_rotation = angle
-            self._initialize_camera()
+        self.current_rotation = angle
+        self._reconfigure_camera()
         return True
 
     def take_custom_photo(self, width, height):
         """Capture a still JPEG at a requested resolution and restore the stream."""
+        self._stop_frame_producer()
+        self._reset_frame_cache()
         with self.lock:
             old_width, old_height = self.current_width, self.current_height
             try:
@@ -248,7 +316,8 @@ class RpiCamZ:
                     self.picam2.stop()
                     self.is_running = False
                 self.current_width, self.current_height = old_width, old_height
-                self._initialize_camera()
+                self._configure_running_camera_locked()
+        self._start_frame_producer()
 
     def _capture_jpeg_bytes(self) -> bytes:
         """Capture a JPEG into memory.
@@ -260,23 +329,91 @@ class RpiCamZ:
         self.picam2.capture_file(buf, format="jpeg")
         return buf.getvalue()
 
-    def get_frame_packet(self) -> FramePacket:
-        """Capture a JPEG frame together with per-frame timing metadata."""
-        with self.lock:
-            jpeg_bytes = self._capture_jpeg_bytes()
-            captured_wall_time_ns = time.time_ns()
-            captured_monotonic_ns = time.monotonic_ns()
-            self._frame_counter += 1
-            return FramePacket(
-                frame_id=self._frame_counter,
-                jpeg_bytes=jpeg_bytes,
-                captured_wall_time_ns=captured_wall_time_ns,
-                captured_monotonic_ns=captured_monotonic_ns,
+    def _capture_frame_packet_locked(self) -> FramePacket:
+        """Capture a JPEG frame and build a packet while holding ``self.lock``."""
+        jpeg_bytes = self._capture_jpeg_bytes()
+        captured_wall_time_ns = time.time_ns()
+        captured_monotonic_ns = time.monotonic_ns()
+        self._frame_counter += 1
+        return FramePacket(
+            frame_id=self._frame_counter,
+            jpeg_bytes=jpeg_bytes,
+            captured_wall_time_ns=captured_wall_time_ns,
+            captured_monotonic_ns=captured_monotonic_ns,
+        )
+
+    def _store_frame_packet(self, frame_packet: FramePacket, frame_generation: int) -> None:
+        """Publish a captured frame to latest-frame state and recent buffer."""
+        with self._frame_condition:
+            if frame_generation != self._frame_generation or not self._frame_thread_running:
+                return
+            self._latest_frame = frame_packet
+            self._frame_buffer.append(frame_packet)
+            self._frame_condition.notify_all()
+
+    def _frame_worker(self, frame_generation: int) -> None:
+        """Capture JPEG frames continuously while the camera pipeline is active."""
+        while not self._frame_stop_event.is_set():
+            started_monotonic = time.monotonic()
+            try:
+                with self.lock:
+                    if not self.is_running:
+                        break
+                    frame_packet = self._capture_frame_packet_locked()
+                self._store_frame_packet(frame_packet, frame_generation)
+            except Exception:
+                logger.exception("Continuous frame capture failed; retrying shortly.")
+                if self._frame_stop_event.wait(max(self.frame_interval_seconds, 0.1)):
+                    break
+                continue
+
+            elapsed = time.monotonic() - started_monotonic
+            sleep_seconds = max(0.0, self.frame_interval_seconds - elapsed)
+            if self._frame_stop_event.wait(sleep_seconds):
+                break
+
+        with self._frame_condition:
+            if frame_generation == self._frame_generation:
+                self._frame_thread_running = False
+            self._frame_condition.notify_all()
+
+    def _wait_for_latest_frame(self, timeout_seconds: float | None = None) -> FramePacket:
+        """Wait briefly for the next available frame packet."""
+        wait_timeout = (
+            self._frame_wait_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        with self._frame_condition:
+            has_frame = self._frame_condition.wait_for(
+                lambda: self._latest_frame is not None or not self._frame_thread_running,
+                timeout=wait_timeout,
             )
+            if has_frame and self._latest_frame is not None:
+                return self._latest_frame
+
+        raise RuntimeError("No JPEG frame is available from the continuous producer.")
+
+    def get_latest_frame_packet(self, timeout_seconds: float | None = None) -> FramePacket:
+        """Return the most recent frame produced by the background capture thread."""
+        return self._wait_for_latest_frame(timeout_seconds=timeout_seconds)
+
+    def get_recent_frames(self, limit: int | None = None) -> list[FramePacket]:
+        """Return a snapshot of recent frame packets from the local ring buffer."""
+        with self._frame_condition:
+            frames = list(self._frame_buffer)
+
+        if limit is None:
+            return frames
+        return frames[-max(0, int(limit)) :]
+
+    def get_frame_packet(self) -> FramePacket:
+        """Return the most recent background-produced frame packet."""
+        return self.get_latest_frame_packet()
 
     def get_jpeg_frame(self) -> bytes:
-        """Capture a JPEG frame directly from the running pipeline."""
-        return self.get_frame_packet().jpeg_bytes
+        """Return the JPEG payload from the latest background-produced frame."""
+        return self.get_latest_frame_packet().jpeg_bytes
 
     def start_timelapse(self, interval_seconds, width=None, height=None):
         """Start a background timelapse capture thread."""
