@@ -112,6 +112,19 @@ def test_background_producer_supplies_existing_public_frame_apis(fake_camera):
     assert first_packet.frame_id >= 1
 
 
+def test_get_frame_packet_returns_latest_immediately_after_startup_wait(fake_camera):
+    first_packet = fake_camera.get_frame_packet()
+    capture_count = fake_camera.picam2.capture_count
+    start_time = time.monotonic()
+
+    latest_packet = fake_camera.get_latest_frame_packet(timeout_seconds=0.2)
+    elapsed = time.monotonic() - start_time
+
+    assert latest_packet == first_packet
+    assert fake_camera.picam2.capture_count == capture_count
+    assert elapsed < 0.05
+
+
 def test_recent_frame_buffer_is_bounded_and_queryable(monkeypatch):
     monkeypatch.setattr(camera_module, "CAMERA_IMPORT_ERROR", None)
     monkeypatch.setattr(camera_module, "Picamera2", FakePicamera2)
@@ -183,3 +196,14 @@ def test_close_stops_frame_producer_thread(fake_camera):
     assert thread is not None
     assert thread.is_alive() is False
     assert fake_camera.picam2.closed is True
+
+
+def test_frame_producer_status_exposes_minimal_timing_state(fake_camera):
+    frame_packet = fake_camera.get_frame_packet()
+
+    status = fake_camera.get_frame_producer_status()
+
+    assert status["frame_id"] == frame_packet.frame_id
+    assert status["last_capture_duration_ms"] is not None
+    assert status["last_capture_duration_ms"] >= 0
+    assert status["last_publish_wall_time_ns"] is not None
