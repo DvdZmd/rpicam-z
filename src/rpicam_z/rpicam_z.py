@@ -46,7 +46,7 @@ class RpiCamZ:
         height=1232,
         rotation=0,
         save_path="captures",
-        frame_interval_seconds=0.033,
+        frame_interval_seconds=0.1,
         frame_buffer_size=60,
     ):
         if CAMERA_IMPORT_ERROR is not None:
@@ -90,9 +90,7 @@ class RpiCamZ:
         self._frame_generation = 0
         self._latest_frame = None
         self._frame_buffer = deque(maxlen=self._frame_buffer_size)
-        self._frame_wait_timeout_seconds = max(0.1, self.frame_interval_seconds * 3)
-        self._last_capture_duration_ms = None
-        self._last_publish_wall_time_ns = None
+        self._frame_wait_timeout_seconds = max(0.1, self.frame_interval_seconds * 5)
 
         self._detect_sensor_limits()
         self._reconfigure_camera()
@@ -148,7 +146,6 @@ class RpiCamZ:
         with self._frame_condition:
             self._latest_frame = None
             self._frame_buffer.clear()
-            self._last_publish_wall_time_ns = None
 
     def _start_frame_producer(self):
         """Start the background JPEG producer for the active camera pipeline."""
@@ -351,7 +348,6 @@ class RpiCamZ:
             if frame_generation != self._frame_generation or not self._frame_thread_running:
                 return
             self._latest_frame = frame_packet
-            self._last_publish_wall_time_ns = time.time_ns()
             self._frame_buffer.append(frame_packet)
             self._frame_condition.notify_all()
 
@@ -363,12 +359,7 @@ class RpiCamZ:
                 with self.lock:
                     if not self.is_running:
                         break
-                    capture_started_ns = time.monotonic_ns()
                     frame_packet = self._capture_frame_packet_locked()
-                    capture_finished_ns = time.monotonic_ns()
-                self._last_capture_duration_ms = (
-                    capture_finished_ns - capture_started_ns
-                ) / 1_000_000
                 self._store_frame_packet(frame_packet, frame_generation)
             except Exception:
                 logger.exception("Continuous frame capture failed; retrying shortly.")
@@ -388,10 +379,6 @@ class RpiCamZ:
 
     def _wait_for_latest_frame(self, timeout_seconds: float | None = None) -> FramePacket:
         """Wait briefly for the next available frame packet."""
-        latest_frame = self._latest_frame
-        if latest_frame is not None:
-            return latest_frame
-
         wait_timeout = (
             self._frame_wait_timeout_seconds
             if timeout_seconds is None
@@ -410,15 +397,6 @@ class RpiCamZ:
     def get_latest_frame_packet(self, timeout_seconds: float | None = None) -> FramePacket:
         """Return the most recent frame produced by the background capture thread."""
         return self._wait_for_latest_frame(timeout_seconds=timeout_seconds)
-
-    def get_frame_producer_status(self) -> dict[str, int | float | None]:
-        """Return a compact snapshot of producer timing and publication state."""
-        latest_frame = self._latest_frame
-        return {
-            "frame_id": None if latest_frame is None else latest_frame.frame_id,
-            "last_capture_duration_ms": self._last_capture_duration_ms,
-            "last_publish_wall_time_ns": self._last_publish_wall_time_ns,
-        }
 
     def get_recent_frames(self, limit: int | None = None) -> list[FramePacket]:
         """Return a snapshot of recent frame packets from the local ring buffer."""
