@@ -41,8 +41,8 @@ class RpiCamZ:
 
     def __init__(
         self,
-        width=1640,
-        height=1232,
+        width=1280,
+        height=720,
         rotation=0,
         save_path="captures",
         frame_interval_seconds=0.1,
